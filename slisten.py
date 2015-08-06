@@ -3,16 +3,18 @@ import requests
 import time
 import hashlib
 import struct
+import threading
 from lxml import html
 SWC_CMAG="578134"
 SWC_LKID=b"msmsgs@msnmsgr.com"
 SWC_LKEY=b"Q1P7W2E4J9R8U3S5"
 SWC_MNUM=0x0E79A9C1
 SWC_NAME="swx-skype.com"
-SWC_VERS="908/1.5.108"
+SWC_VERS="908/1.7.251"
 SWC_HMDV="client-s.gateway.messenger.live.com"
 SWC_HLOG="login.skype.com"
 SWC_HCON="api.skype.com"
+SWC_HCNV="contacts.skype.com"
 SWC_HVID="vm.skype.com"
 SWC_IPIE="pie"
 SWC_IETM="etm"
@@ -22,7 +24,81 @@ PIE_MAGICK='"pie" value="'
 ETM_MAGICK='"etm" value="'
 TOKEN_MAGICK='"skypetoken" value="'
 
-sc={}
+sc={
+		"sess":requests.session(),
+		"lock":threading.Lock(),
+		"reqs":{},
+		"cook":{},
+		"hmsg":SWC_HMDV,
+		"tarq":0
+		}
+
+def sc_lock():
+	ret=sc["lock"].acquire(True)
+	assert ret==True
+
+def sc_unlock():
+	ret=sc["lock"].release()
+
+def std_headers(url):
+	global sc
+	host=requests.utils.urlparse(url).netloc
+	ret={
+			"Host":host,
+			"Accept-Encodings":"gzip",
+			"Connection":"close"
+			}
+	#"BehaviorOverride":"redirectAs404",
+	if ( host==SWC_HCON or host==SWC_HVID or host==SWC_HCNV ):
+		h={
+				"X-Skypetoken":sc["st"],
+				"X-Stratus-Caller":SWC_NAME,
+				"X-Stratus-Request":"abcd1234",
+				"Origin":"https://web.skype.com/",
+				"Referer":"https://web.skype.com/main",
+				"Accept":"application/json; ver=1.0;",
+				}
+	elif ( host==sc["hmsg"] ):
+		h={
+			"RegistrationToken":sc["rtok"],
+			"Referer":"https://web.skype.com/main",
+			"Accept":"application/json; ver=1.0;",
+			"ClientInfo":"os=Windows; osVer=8.1; proc=Win32; lcid=en-us; deviceType=1; country=n/a; clientName=" + SWC_NAME + "; clientVer=" + SWC_VERS,
+			}
+	else:
+		h={
+				"Accept":"*/*"
+				}
+	ret.update(h)
+	return ret
+
+def req_async(rq,cb,n):
+	global sc
+	s=sc["sess"]
+	r=s.send(rq)
+	sc_lock()
+	sc["cook"].update(r.cookies)
+	sc_unlock()
+	if cb is not None:
+		cb(r)
+	sc_lock()
+	sc["reqs"].pop(n,"")
+	sc_unlock()
+
+def req(method,url,params=None,json=None,headers=None,data=None,cookies=None,cb=None):
+	global sc
+	s=sc["sess"]
+	h=headers
+	if h is None:
+			h=std_headers(url)
+	r=requests.Request(method,url,headers=h,params=params,json=json,data=data,cookies=sc["cook"])
+	pr=s.prepare_request(r)
+	n="[⌚%f]%s␣%s␣HTTP/1.0"%(time.time(),method.upper(),url),
+	t=threading.Thread(group=None,target=req_async,name=n,args=(pr,cb,n))
+	sc_lock()
+	sc["reqs"].update({n:t})
+	sc_unlock()
+	t.start()
 
 def mshash(data):
 	def little_endify(value, c_type="L"):
@@ -73,17 +149,6 @@ def mshash(data):
 
 def subscribe():
 	global sc
-	h={
-			"ClientInfo":"os=Windows; osVer=8.1; proc=Win32; lcid=en-us; deviceType=1; country=n/a; clientName=" + SWC_NAME + "; clientVer=" + SWC_VERS,
-			"Connection":"close",
-			"Accept":"application/json; ver=1.0;",
-			"BehaviorOverride":"redirectAs404",
-			"Origin":"https://web.skype.com/",
-			"Referer":"https://web.skype.com/main",
-			"RegistrationToken":sc["rtok"],
-			"Accept-Encodings":"gzip",
-			"Content-Type":"application/json",
-			}
 	p={
 			"interestedResources":[
 				"/v1/users/ME/conversations/ALL/properties",
@@ -94,24 +159,11 @@ def subscribe():
 			"template":"raw",
 			"channelType":"httpLongPoll"
 			}
-	r=requests.post('https://'+sc["hmsg"]+"/v1/users/ME/endpoints/SELF/subscriptions",json=p,headers=h,cookies=sc["cook"])
-	sc["cook"].update(r.cookies)
-	dothings()
+	req('post','https://'+sc["hmsg"]+"/v1/users/ME/endpoints/"+sc["epid"]+"/subscriptions",json=p,cb=dothings)
 
-def getid():
+def getid_cb(r):
 	global sc
-	h={
-			"X-Skypetoken":sc["st"],
-			"X-Stratus-Caller":SWC_NAME,
-			"X-Stratus-Request":"abcd1234",
-			"Connection":"close",
-			"Accept":"application/json; ver=1.0;",
-			"Origin":"https://web.skype.com/",
-			"Referer":"https://web.skype.com/main",
-			"Accept-Encodings":"gzip"
-			}
-	r=requests.get('https://'+SWC_HCON+'/users/self/displayname',headers=h,json={},cookies=sc["cook"])
-	sc["cook"].update(r.cookies)
+	sc_lock()
 	j=r.json()
 	sc["unam"]=j["username"]
 	if("displayname" in j):
@@ -121,47 +173,22 @@ def getid():
 			sc["nick"]=j["firstname"]
 		else:
 			sc["nick"]=j["username"]
+	sc_unlock()
+
+def getid():
+	global sc
+	req('get','https://'+SWC_HCON+'/users/self/displayname',json={},cb=getid_cb)
 
 def subuser(u):
 	global sc
-	h={
-			"ClientInfo":"os=Windows; osVer=8.1; proc=Win32; lcid=en-us; deviceType=1; country=n/a; clientName=" + SWC_NAME + "; clientVer=" + SWC_VERS,
-			"Connection":"close",
-			"Accept":"application/json; ver=1.0;",
-			"Origin":"https://web.skype.com/",
-			"Referer":"https://web.skype.com/main",
-			"Accept-Encodings":"gzip",
-			"Content-Type":"application/json",
-			"X-Skypetoken":sc["st"],
-			"X-Stratus-Caller":SWC_NAME,
-			"X-Stratus-Request":"abcd1234",
-			"RegistrationToken":sc["rtok"],
-			"Accept-Encodings":"gzip",
-			"Content-Type":"application/json",
-			}
 	p={
 			"contacts":{
 				"id":"8:"+u
 				}
 			}
-	r=requests.get('https://'+sc["hmsg"]+'/users/ME/contacts',headers=h,json={})
-	
-def authrq():
-	global sc
-	h={
-			"Host":SWC_HCON,
-			"X-Skypetoken":sc["st"],
-			"X-Stratus-Caller":SWC_NAME,
-			"X-Stratus-Request":"abcd1234",
-			"Connection":"keepAlive",
-			"Accept":"application/json; ver=1.0;",
-			"Origin":"https://web.skype.com/",
-			"Referer":"https://web.skype.com/main",
-			"Accept-Encodings":"gzip"
-			}
-	r=requests.get('https://'+SWC_HCON+'/users/self/contacts/auth-request',headers=h,cookies=sc["cook"])
-	sc["cook"].update(r.cookies)
-	sc["fnord"]=r
+	req('get','https://'+sc["hmsg"]+'/users/ME/contacts',json={})
+
+def authrq_cb(r):
 	j=r.json()
 	lt=sc["tarq"]
 	for r in j:
@@ -172,32 +199,45 @@ def authrq():
 		gr=r["greeting"]
 		if (int(et)<=int(sc["tarq"])):
 			continue
-		r=requests.put('https://'+SWC_HCON+'/users/self/contacts/auth-request/'+sn+"/accept",headers=h,json={},cookies=sc["cook"])
-		sc["cook"].update(r.cookies)
+		req('put','https://'+SWC_HCON+'/users/self/contacts/auth-request/'+sn+"/accept",json={})
 		subuser(sn)
 		lt=max(lt,et)
+	sc_lock()
 	sc["tarq"]=lt
-			
-def blist():
+	sc["fnord"]=r
+	sc_unlock()
+
+def authrq():
 	global sc
-	h={
-			"Connection":"close",
-			"Accept":"application/json; ver=1.0;",
-			"BehaviorOverride":"redirectAs404",
-			"Origin":"https://web.skype.com/",
-			"Referer":"https://web.skype.com/main",
-			"Accept-Encodings":"gzip",
-			"Content-Type":"application/json",
-			"X-Skypetoken":sc["st"],
-			"X-Stratus-Caller":SWC_NAME,
-			"X-Stratus-Request":"abcd1234",
-			}
-	r=requests.get('https://'+SWC_HCON+'/users/self/contacts',headers=h,json={},cookies=sc["cook"])
-	sc["cook"].update(r.cookies)
+	req('get','https://'+SWC_HCON+'/users/self/contacts/auth-request',cb=authrq_cb)
+
+def blist_cb(r):
 	j=r.json()
 	for r in j:
 		sn=r["skypename"]
 		subuser(sn)
+
+def blist():
+	global sc
+	req('get','https://'+SWC_HCON+'/users/self/contacts',json={},cb=blist_cb)
+
+def token_cb(r):
+	if("location" in r.headers):
+		hnew=requests.utils.urlparse(r.headers["location"]).netloc
+		if (sc["hmsg"]!=hnew):
+			sc_lock()
+			sc["hmsg"]=hnew
+			sc_unlock()
+			token()
+			return
+	rth=r.headers["Set-RegistrationToken"]
+	rtl=requests.utils.parse_header_links(rth)[0]
+	sc_lock()
+	sc["rtok"]=rtl["url"]
+	sc["rexp"]=rtl["expires"]
+	sc["epid"]=rtl["endpointId"]
+	sc_unlock()
+	subscribe()
 
 def token():
 	global sc
@@ -215,21 +255,8 @@ def token():
 			"BehaviorOverride":"redirectAs404",
 			"Host":sc["hmsg"]
 			}
-	r=requests.post("https://"+sc["hmsg"]+"/v1/users/ME/endpoints",json={},headers=h)
-	assert r.status_code>=200
-	assert r.status_code<=201
-	if("location" in r.headers):
-		hnew=requests.utils.urlparse(r.headers["Location"]).netloc
-		if (sc["hmsg"]!=hnew):
-			sc["hmsg"]=hnew
-			token()
-			return
-	rth=r.headers["Set-RegistrationToken"]
-	rtl=requests.utils.parse_header_links(rth)[0]
-	sc["rtok"]=rtl["url"]
-	sc["rexp"]=rtl["expires"]
-	sc["epid"]=rtl["endpointId"]
-	subscribe()
+	req('post',"https://"+sc["hmsg"]+"/v1/users/ME/endpoints",json={},headers=h,cb=token_cb)
+
 
 def link():
 	print("link...")
@@ -254,29 +281,27 @@ def link():
 	s={
 			"status":"Online"
 			}
-	h={
-			"ClientInfo":"os=Windows; osVer=8.1; proc=Win32; lcid=en-us; deviceType=1; country=n/a; clientName=" + SWC_NAME + "; clientVer=" + SWC_VERS,
-			"Connection":"keepAlive",
-			"Accept":"application/json; ver=1.0;",
-			"BehaviorOverride":"redirectAs404",
-			"Origin":"https://web.skype.com/",
-			"Referer":"https://web.skype.com/main",
-			"Content-Type":"application/json",
-			"RegistrationToken":sc["rtok"],
-			"Accept-Encodings":"gzip",
-			"Host":sc["hmsg"]
-			}
-	r=requests.post("https://"+sc["hmsg"]+"/v1/users/ME/presenceDocs/messagingService",headers=h,json=s,cookies=sc["cook"])
-	sc["cook"].update(r.cookies)
-	print(r.status_code)
-	print(r.headers)
-	print(r.text)
-	r=requests.post(url,headers=h,json=p,cookies=sc["cook"])
-	sc["cook"].update(r.cookies)
-	print(r.status_code)
-	print(r.headers)
-	print(r.text)
-	sc["cook"].update(r.cookies)
+	req('put',"https://"+sc["hmsg"]+"/v1/users/ME/presenceDocs/messagingService",json=s)
+	req('put',url,json=p)
+
+def poll_cb(r):
+	if(r.text==""):
+		if (int(time.time())>int(sc["rexp"])):
+			token()
+		return
+	j=r.json()
+	if("errorCode" in j):
+		if(j["errorCode"]==729):
+			token()
+			return
+	if("eventMessages" in j):
+		for r in j["eventMessages"]:
+			res=r["resource"]
+			if(r["resourceType"]=="NewMessage"):
+				mt=res["messagetype"]
+				if(mt=="Text" or mt=="RichText"):
+					print("%s|%s> %s"%(res["originalarrivaltime"],res["imdisplayname"],res["content"]),end='')
+	poll()
 
 def poll():
 	global sc
@@ -292,33 +317,22 @@ def poll():
 			"Accept-Encodings":"gzip",
 			"Host":sc["hmsg"]
 			}
-	r=requests.post('https://'+sc["hmsg"]+"/v1/users/ME/endpoints/SELF/subscriptions/0/poll",headers=h,json={},cookies=sc["cook"])
-	if (int(time.time())>int(sc["rexp"])):
-		token()
-		return
-	if(r.text==""):
-		return {}
-	j=r.json()
-	if("errorCode" in j):
-		if(j["errorCode"]==729):
-			token()
-			return {}
-	sc["cook"].update(r.cookies)
-	return j
+	req('post','https://'+sc["hmsg"]+"/v1/users/ME/endpoints/"+sc["epid"]+"/subscriptions/0/poll",json={},cb=poll_cb)
 
-def dothings():
+
+def dothings(r=None):
 	global sc
 	if ("rtok" in sc):
 		getid()
 		authrq()
 		blist()
+		poll()
+		link()
 	else:
 		token()
 
 def login(username,password):
 	global sc
-	sc["hmsg"]=SWC_HMDV
-	sc["tarq"]=0
 	h={
 			"ClientInfo":"os=Windows; osVer=8.1; proc=Win32; lcid=en-us; deviceType=1; country=n/a; clientName=" + SWC_NAME + "; clientVer=" + SWC_VERS,
 			"Content-Type":"Content-Type: application/x-www-form-urlencoded; charset=UTF-8",
@@ -333,6 +347,9 @@ def login(username,password):
 			"redirect_uri":"https://web.skype.com"
 			}
 	r=requests.get('https://'+SWC_HLOG+'/login',params=p)
+	if("location" in r.headers):
+		print("Redirecting to "+r.headers["location"])
+		r=requests.get(r.headers["location"],params=p)
 	assert r.status_code==200
 	t=html.fromstring(r.text)
 	sc["pie"]=t.xpath(SWC_IURI%SWC_IPIE)[0]
@@ -361,6 +378,9 @@ def login(username,password):
 			"redirect_uri":"https://web.skype.com/"
 			}
 	r=requests.post("https://"+SWC_HLOG+"/login",params=d,data=p,headers=h)
+	if("location" in r.headers):
+		print("Redirecting to "+r.headers["location"])
+		r=requests.post(r.headers["Location"],params=d,data=p,headers=h)
 	sc["cook"]=r.cookies
 	assert r.status_code==200
 	t=html.fromstring(r.text)
@@ -370,18 +390,12 @@ def login(username,password):
 	else:
 		#unhandled captcha
 		return "CAPTCHA!"
-	token()
+	dothings()
 	return "OK~"
 
 
 print(login("rtmfaerie","OppaiDolly"))
 while 1:
-	j=poll()
-	if("eventMessages" in j):
-		for r in j["eventMessages"]:
-			res=r["resource"]
-			if(r["resourceType"]=="NewMessage"):
-				mt=res["messagetype"]
-				if(mt=="Text" or mt=="RichText"):
-					print("%s|%s> %s"%(res["originalarrivaltime"],res["imdisplayname"],res["content"]))
+	if (len(sc["reqs"])==0):
+		poll()
 	time.sleep(1)
