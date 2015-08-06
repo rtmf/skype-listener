@@ -300,7 +300,7 @@ def poll_cb(r):
 			if(r["resourceType"]=="NewMessage"):
 				mt=res["messagetype"]
 				if(mt=="Text" or mt=="RichText"):
-					print("%s|%s> %s"%(res["originalarrivaltime"],res["imdisplayname"],res["content"]),end='')
+					print("%s|%s> %s"%(res["originalarrivaltime"],res["imdisplayname"],res["content"].strip()))
 	poll()
 
 def poll():
